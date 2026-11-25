@@ -1,7 +1,7 @@
 /**
  * @name ReactionInbox
  * @author WillZero
- * @version 1.7.0
+ * @version 1.7.1
  * @description An in-app Reaction Inbox for Discord that tracks emoji reactions to your messages across all servers (including muted and 100k+ member servers) and DMs, styled to match Discord's native Inbox.
  * @website https://github.com/willzero123/discord-reaction-inbox
  * @source https://raw.githubusercontent.com/willzero123/discord-reaction-inbox/main/ReactionInbox.plugin.js
@@ -796,6 +796,9 @@ module.exports = class ReactionInbox {
         this.restApi = null;
         this.observer = null;
         this.mountTimer = null;
+        this.mountRetryTimer = null;
+        this.dockedAnchor = null;
+        this.anchorMissCount = 0;
         this.syncTimer = null;
         this.autoSyncInterval = null;
         this.timeTicker = null;
@@ -822,6 +825,8 @@ module.exports = class ReactionInbox {
 
     start() {
         this.stopped = false;
+        this.dockedAnchor = null;
+        this.anchorMissCount = 0;
         this.fetchQueue = [];
         this.queuedFetchKeys.clear();
         this.failedFetchKeys.clear();
@@ -910,6 +915,12 @@ module.exports = class ReactionInbox {
             clearTimeout(this.mountTimer);
             this.mountTimer = null;
         }
+        if (this.mountRetryTimer) {
+            clearTimeout(this.mountRetryTimer);
+            this.mountRetryTimer = null;
+        }
+        this.dockedAnchor = null;
+        this.anchorMissCount = 0;
         if (this.syncTimer) {
             clearTimeout(this.syncTimer);
             this.syncTimer = null;
@@ -2409,18 +2420,46 @@ module.exports = class ReactionInbox {
 
     startObserver() {
         this.observer = new MutationObserver(() => {
-            if (!document.getElementById(BTN_ID)) {
+            if (this.stopped) return;
+            const btn = document.getElementById(BTN_ID);
+            const isFloating = Boolean(btn && btn.classList.contains("ri-floating"));
+            const displaced =
+                !btn ||
+                isFloating ||
+                !this.dockedAnchor ||
+                !this.dockedAnchor.isConnected ||
+                btn.nextElementSibling !== this.dockedAnchor;
+
+            if (displaced) {
                 if (this.mountTimer) clearTimeout(this.mountTimer);
-                this.mountTimer = setTimeout(() => this.ensureButtonMounted(), 120);
+                this.mountTimer = setTimeout(() => this.ensureButtonMounted(), isFloating ? 250 : 120);
             }
         });
         this.observer.observe(document.body, { childList: true, subtree: true });
     }
 
     findInboxAnchor() {
-        const inboxBtn = document.querySelector(
-            'button[aria-label="Inbox"], [role="button"][aria-label="Inbox"], div[aria-label="Inbox"]'
-        );
+        const selector =
+            'button[aria-label="Inbox"], [role="button"][aria-label="Inbox"], div[aria-label="Inbox"], button[aria-label^="Inbox"], [role="button"][aria-label^="Inbox"]';
+        const candidates =
+            typeof document.querySelectorAll === "function"
+                ? document.querySelectorAll(selector)
+                : [document.querySelector?.(selector)].filter(Boolean);
+        if (!candidates || candidates.length === 0) return null;
+
+        let inboxBtn = null;
+        let fallbackBtn = null;
+        for (const el of candidates) {
+            if (!el || !el.parentElement || el.id === BTN_ID) continue;
+            const rect = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+            if (!rect || (rect.width === 0 && rect.height === 0)) continue;
+            if (rect.top >= 0 && rect.top < 80) {
+                inboxBtn = el;
+                break;
+            }
+            if (!fallbackBtn) fallbackBtn = el;
+        }
+        inboxBtn = inboxBtn || fallbackBtn;
         if (!inboxBtn || !inboxBtn.parentElement) return null;
 
         let anchor = inboxBtn;
@@ -2435,19 +2474,7 @@ module.exports = class ReactionInbox {
         return anchor;
     }
 
-    ensureButtonMounted() {
-        const existing = document.getElementById(BTN_ID);
-        const anchor = this.findInboxAnchor();
-
-        if (existing) {
-            if (existing.classList.contains("ri-floating") && anchor?.parentElement) {
-                existing.classList.remove("ri-floating");
-                anchor.parentElement.insertBefore(existing, anchor);
-            }
-            this.updateBadge();
-            return;
-        }
-
+    createHeaderButton() {
         const btn = document.createElement("button");
         btn.id = BTN_ID;
         btn.type = "button";
@@ -2458,15 +2485,51 @@ module.exports = class ReactionInbox {
             e.stopPropagation();
             this.togglePanel();
         });
+        return btn;
+    }
 
-        if (anchor?.parentElement) {
-            anchor.parentElement.insertBefore(btn, anchor);
-        } else if (this.settings.useFloatingFallback) {
-            btn.classList.add("ri-floating");
-            document.body.appendChild(btn);
+    ensureButtonMounted() {
+        if (this.stopped) return;
+        if (this.mountRetryTimer) {
+            clearTimeout(this.mountRetryTimer);
+            this.mountRetryTimer = null;
         }
 
-        this.updateBadge();
+        const existing = document.getElementById(BTN_ID);
+        const anchor = this.findInboxAnchor();
+
+        if (anchor?.parentElement) {
+            this.anchorMissCount = 0;
+            const btn = existing || this.createHeaderButton();
+            btn.classList.remove("ri-floating");
+            if (btn.parentElement !== anchor.parentElement || btn.nextElementSibling !== anchor) {
+                anchor.parentElement.insertBefore(btn, anchor);
+            }
+            this.dockedAnchor = anchor;
+            this.updateBadge();
+            return;
+        }
+
+        this.dockedAnchor = null;
+
+        if (existing) {
+            this.updateBadge();
+            return;
+        }
+
+        // Brief grace period before using floating fallback so transient Discord re-renders never jump the icon
+        this.anchorMissCount++;
+        if (this.anchorMissCount <= 10) {
+            this.mountRetryTimer = setTimeout(() => this.ensureButtonMounted(), 250);
+            return;
+        }
+
+        if (this.settings.useFloatingFallback) {
+            const btn = this.createHeaderButton();
+            btn.classList.add("ri-floating");
+            document.body.appendChild(btn);
+            this.updateBadge();
+        }
     }
 
     isDmEntry(entry) {
